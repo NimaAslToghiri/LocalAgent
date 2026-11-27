@@ -1,0 +1,4 @@
+**
+!requirements.txt
+!assistant_agent/**/*.py
+!assistant_agent/ui.html

@@ -4,14 +4,14 @@ Signal is a local LangGraph learning project using Qwen3 4B AWQ. It answers dire
 
 ## Run locally
 
-Use Linux, Python 3.10, `uv`, and a working NVIDIA driver. Run `nvidia-smi` first. The Python package versions in `assistant_agent/requirements.txt` match the project's environment; use a [vLLM wheel and PyTorch CUDA build compatible with your driver](https://docs.vllm.ai/en/v0.21.0/getting_started/installation/gpu/).
+Use Linux, Python 3.10, `uv`, and a working NVIDIA driver. Run `nvidia-smi` first. Install the versions in `requirements.txt` with a [vLLM wheel and PyTorch CUDA build compatible with your driver](https://docs.vllm.ai/en/v0.21.0/getting_started/installation/gpu/).
 
 From the repository root:
 
 ```bash
 uv venv --python 3.10
 source .venv/bin/activate
-uv pip install --torch-backend=auto -r assistant_agent/requirements.txt
+uv pip install --torch-backend=auto -r requirements.txt
 python download_model.py          # Skip if the 4B AWQ files are already present.
 python -m assistant_agent.server
 ```
@@ -21,6 +21,34 @@ Open `http://127.0.0.1:8000`. The browser server binds only to the local machine
 Both entry points use the same optional root `.env` settings; see `.env.example`. An optional `HUGGINGFACE_TOKEN` stays in `.env`. The embedding model (`all-MiniLM-L6-v2`) loads on the CPU and downloads on first use if it is absent from the Hugging Face cache. If vLLM cannot reserve enough GPU memory, close other GPU apps or try `MAX_MODEL_LEN=4096`. The browser falls back to plain text if its Markdown or sanitization library cannot load.
 
 If Signal needs a specific CUDA toolkit, add `CUDA_HOME=/usr/local/cuda-12.6` to the root `.env` (adjust the path for your installation). Both launch commands load it before PyTorch or vLLM, and Signal sets `CUDA_PATH` and puts the toolkit's `bin` directory on `PATH` for that process. Restart Signal after changing the setting. If PyTorch or vLLM is already loaded in a notebook or IDE session, restart that Python process too.
+
+## Run with Docker
+
+1. **Expose the GPU to Docker.** On Ubuntu or Pop!_OS, follow NVIDIA's Apt instructions to add the repository and install `nvidia-container-toolkit`. Then configure Docker and verify that a test container reports your GPU. Restarting Docker also restarts or stops any containers already running. [NVIDIA installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#installing-with-apt)
+
+   ```bash
+   sudo nvidia-ctk runtime configure --runtime=docker
+   sudo systemctl restart docker
+   docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
+   ```
+
+2. **Prepare the mounts.** From the repository root, run `mkdir -p .signal` and check that `models/Qwen3-4b-AWQ/config.json` exists. If the model is missing, run `python download_model.py` in the host Python environment. Compose mounts the weights read-only and uses `.signal` for existing chats, logs, and caches. Set `MODEL_PATH` or `SIGNAL_DATA_DIR` in `.env` for custom host paths. If your Linux user ID or group ID differs from 1000, set `SIGNAL_UID` and `SIGNAL_GID` to the values reported by `id -u` and `id -g`.
+
+3. **Build the image.** `Dockerfile` starts from vLLM 0.21.0 with its CUDA stack and installs the project's pinned packages. `.dockerignore` lets the build receive just the application and requirements. The model, chats, and Hugging Face token stay on the host.
+
+   ```bash
+   docker compose config --quiet
+   docker compose build
+   ```
+
+4. **Start and verify.** Stop the native Signal process first so that Docker can use the GPU and port. Compose makes the GPU and mounts available and publishes the browser port on localhost. Open `http://127.0.0.1:8000` once startup completes. The first message may download the public embedding model into the mounted cache.
+
+   ```bash
+   docker compose up -d
+   docker compose logs -f signal
+   ```
+
+5. **Stop or rebuild.** Press Ctrl+C to exit the log view. Run `docker compose down` to stop the container. The bind-mounted chats and weights persist. After changing the code or dependencies, use `docker compose up -d --build`.
 
 ## How a turn runs
 

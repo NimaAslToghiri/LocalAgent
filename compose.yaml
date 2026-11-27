@@ -1,0 +1,28 @@
+services:
+  signal:
+    build: .
+    runtime: nvidia
+    gpus: all
+    shm_size: 1gb
+    user: "${SIGNAL_UID:-1000}:${SIGNAL_GID:-1000}"
+    ports:
+      - "127.0.0.1:${SIGNAL_PORT:-8000}:8000"
+    environment:
+      HOME: /data
+      XDG_CACHE_HOME: /data/cache
+      TZ: ":/etc/localtime"
+      MAX_MODEL_LEN: "${MAX_MODEL_LEN:-8192}"
+      GPU_MEMORY_UTILIZATION: "${GPU_MEMORY_UTILIZATION:-0.90}"
+    volumes:
+      - type: bind
+        source: "${MODEL_PATH:-./models/Qwen3-4b-AWQ}"
+        target: /model
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${SIGNAL_DATA_DIR:-./.signal}"
+        target: /data
+        bind:
+          create_host_path: false
+      - /etc/localtime:/etc/localtime:ro

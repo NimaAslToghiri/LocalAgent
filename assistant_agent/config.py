@@ -38,6 +38,7 @@ DATA_DIR = project_path(os.getenv("SIGNAL_DATA_DIR", ".signal"))
 MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", "8192"))
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.90"))
 MAX_INPUT_CHARS = 12_000
+HOST = os.getenv("SIGNAL_HOST", "127.0.0.1")
 PORT = int(os.getenv("SIGNAL_PORT", "8000"))
 
 

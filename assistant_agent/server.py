@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .app import build_agent
-from .config import MAX_INPUT_CHARS, PORT
+from .config import HOST, MAX_INPUT_CHARS, PORT
 from .llm.qwen import ContextLimitError, GenerationError
 
 
@@ -128,4 +128,4 @@ async def ws_chat(websocket: WebSocket):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=PORT, ws_max_size=65_536)
+    uvicorn.run(app, host=HOST, port=PORT, ws_max_size=65_536)
