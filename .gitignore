@@ -1,0 +1,9 @@
+.venv/ 
+.vscode/
+.env
+future_ideas.txt
+pre_run_command.txt
+models/
+logs/
+__pycache__/
+.idea/
