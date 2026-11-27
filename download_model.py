@@ -1,19 +1,21 @@
+"""Download the model used by both Signal entry points."""
+
 import os
-from dotenv import load_dotenv
+
 from huggingface_hub import snapshot_download
 
+from assistant_agent.config import MODEL_PATH, MODEL_REPO
 
-load_dotenv(".env")
 
-# Explicitly defining cache dir to keep things structured
-model_dir = os.path.expanduser("models/Qwen3-8B-AWQ")
+def main() -> None:
+    """Fetch Qwen3 4B AWQ into the configured directory using an optional token."""
+    print(f"Downloading {MODEL_REPO} to {MODEL_PATH}")
+    snapshot_download(
+        repo_id=MODEL_REPO, local_dir=MODEL_PATH,
+        token=os.getenv("HUGGINGFACE_TOKEN"), ignore_patterns=["*.gguf", "*.onnx"],
+    )
+    print("Download complete.")
 
-print("Starting download to:", model_dir)
-snapshot_download(
-    repo_id="Qwen/Qwen3-8B-AWQ",  # Calling the dedicated AWQ repository directly
-    local_dir=model_dir,
-    token=os.getenv("HUGGINGFACE_TOKEN"),
-    local_dir_use_symlinks=False,
-    ignore_patterns=["*.gguf", "*.onnx"] # Ensure we only get what vLLM needs
-)
-print("Download complete!")
+
+if __name__ == "__main__":
+    main()

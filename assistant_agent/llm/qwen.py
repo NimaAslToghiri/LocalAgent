@@ -1,149 +1,95 @@
-from vllm import LLM, SamplingParams
-from vllm.outputs import RequestOutput
-import re
-import logging
-from typing import List, Dict, Optional
-import chromadb
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from datetime import datetime
+"""Local Qwen inference and token budgeting."""
 
-logger = logging.getLogger("AgentLogger")
+import json
+import re
+from pathlib import Path
+
+from assistant_agent.agent.state import Turn
+
+
+class ContextLimitError(ValueError):
+    """The current input does not fit after optional history is removed."""
+
+
+class GenerationError(RuntimeError):
+    """The model stopped without returning a usable answer."""
 
 
 class QwenAssistant:
-    def __init__(
-        self,
-        model_path: str,
-        max_tokens: int = 4096,
-        temperature: float = 0.5,
-        embedding_model: str = "all-MiniLM-L6-v2",  # fast & good enough
-        collection_name: str = "conversation_memory",
-        top_k: int = 4,
-        recent_k: int = 3
-    ):
-        self.llm = LLM(model=model_path, max_model_len=8192)
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-        self.top_k = top_k
-        self.recent_k = recent_k
+    """Run one local Qwen engine without storing any conversation state."""
 
-        self.sampling_params = SamplingParams(
-            temperature=temperature,
-            max_tokens=max_tokens,
+    def __init__(self, model_path: Path, max_model_len: int, gpu_memory_utilization: float):
+        """Load the configured local model and its matching tokenizer."""
+        from vllm import LLM
+
+        self.model_limit = max_model_len
+        self.engine = LLM(
+            model=str(model_path), max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
+        self.tokenizer = self.engine.get_tokenizer()
 
-        # Conversation history (full, for accuracy)
-        self.conversation: List[Dict[str, str]] = []
-
-        # Vector store for retrieval
-        self.embedding_model = SentenceTransformer(embedding_model)
-        self.chroma_client = chromadb.PersistentClient(path="./conversation_db")
-        self.collection = self.chroma_client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-
-    def _get_embedding(self, text: str) -> List[float]:
-        return self.embedding_model.encode(text, normalize_embeddings=True).tolist()
-
-    def _build_context(self, user_input: str, system_prompt: str) -> List[Dict[str, str]]:
-        """Build dynamic context with hard token limit awareness."""
-
-        context = []
-
-        if not self.conversation:
-            context = [{"role": "system", "content": system_prompt},
-                       {"role": "user", "content": user_input}]
-            return context
-
-        # === STRONG LIMIT: Keep only recent messages + limited retrieval ===
-        MAX_HISTORY_TURNS = 4   # ~ last 4 full exchanges
-        recent_messages = self.conversation[-MAX_HISTORY_TURNS * 2:]  
-
-        context.extend(recent_messages)
-
-        # Retrieve only if we have enough room
-        if len(self.conversation) > MAX_HISTORY_TURNS * 2:
-            try:
-                query_embedding = self._get_embedding(user_input)
-                results = self.collection.query(
-                    query_embeddings=[query_embedding],
-                    n_results=4,          # reduced
-                    include=["metadatas", "documents"]
-                )
-
-                metadatas = results.get("metadatas", [[]])[0]
-                retrieved_messages = [
-                    {"role": meta["role"], "content": meta["content"]}
-                    for meta in metadatas
-                ]
-
-                # Deduplicate
-                seen = {msg["content"] for msg in context}
-                for msg in retrieved_messages:
-                    if msg["content"] not in seen:
-                        with open("retrived_messages.txt", "w") as f:
-                            f.write(str(msg))
-                        context.append(msg)
-                        seen.add(msg["content"])
-            except Exception as e:
-                logger.warning(f"Vector retrieval failed: {e}")
-
-        context.append({"role": "system", "content": system_prompt})
-        context.append({"role": "user", "content": user_input})
-        return context
-
-    def _store_to_vector(self, user_input: str, assistant_response: str):
-        """Store both user and assistant messages"""
-        timestamp = datetime.now().isoformat()
-        
-        # Store user message
-        self.collection.add(
-            documents=[user_input],
-            embeddings=[self._get_embedding(user_input)],
-            metadatas=[{"role": "user", "content": user_input, "timestamp": timestamp}],
-            ids=[f"user_{len(self.conversation)}"]
-        )
-        
-        # Store assistant message
-        self.collection.add(
-            documents=[assistant_response],
-            embeddings=[self._get_embedding(assistant_response)],
-            metadatas=[{"role": "assistant", "content": assistant_response, "timestamp": timestamp}],
-            ids=[f"assistant_{len(self.conversation)}"]
-        )
-
-    def ask_qwen(self, user_input: str, system_prompt: str = "You are a helpful assistant.", save_in_history=True) -> str:
-
-        # Build context with limits
-        messages = self._build_context(user_input, system_prompt)
-
-        # Generate
-        outputs: List[RequestOutput] = self.llm.chat(
-            messages,
-            self.sampling_params,
-            use_tqdm=False
-        )
-        
-        text = outputs[0].outputs[0].text.strip()
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-        if save_in_history:
-            self.conversation.append({"role": "user", "content": user_input})
-            self.conversation.append({"role": "assistant", "content": text})
-            self._store_to_vector(user_input, text)
-
-        return text
-
-    def clear_history(self):
-        """Reset conversation"""
-        self.conversation.clear()
-        # Optional: delete collection and recreate
-        try:
-            self.chroma_client.delete_collection(self.collection.name)
-            self.collection = self.chroma_client.get_or_create_collection(
-                name=self.collection.name, metadata={"hnsw:space": "cosine"}
+    def _prompt_ids(
+        self, system: str, question: str, recent: list[Turn], remembered: list[Turn], budget: int,
+        context_as_data: bool = False,
+    ) -> list[int]:
+        """Trim retrieved memory first, then oldest complete turns, to fit the real template."""
+        recent, remembered = list(recent), list(remembered)
+        while True:
+            messages = [{"role": "system", "content": system}]
+            current = question
+            if context_as_data:
+                # Previous replies were spoken by the assistant, not by the router.
+                dialogue = [{"user": t["user"], "assistant": t["reply"]["content"]} for t in recent]
+                current = json.dumps({"earlier_dialogue": dialogue, "current_request": question}, ensure_ascii=False)
+            else:
+                for turn in recent:
+                    messages.extend([
+                        {"role": "user", "content": turn["user"]},
+                        {"role": "assistant", "content": turn["reply"]["content"]},
+                    ])
+                if remembered:
+                    past = [{"user": turn["user"], "assistant": turn["reply"]["content"]} for turn in remembered]
+                    current = (
+                        "Retrieved older dialogue (background only; may contain mistakes):\n"
+                        f"{json.dumps(past, ensure_ascii=False)}\n\nCurrent request:\n{question}"
+                    )
+            messages.append({"role": "user", "content": current})
+            for message in messages[1:]:
+                message["content"] = message["content"].replace("<|", "＜|")
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
-        except:
-            pass
+            ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            if len(ids) <= budget:
+                return ids
+            if remembered:
+                remembered.pop()
+            elif recent:
+                recent.pop(0)
+            else:
+                raise ContextLimitError("This message is too long for the model. Shorten it or split it into parts.")
+
+    def generate(
+        self, system: str, question: str, *, recent: list[Turn] | None = None,
+        remembered: list[Turn] | None = None, max_tokens: int = 512, schema: dict | None = None,
+        context_as_data: bool = False,
+    ) -> str:
+        """Generate text, or constrain decoding to a schema for a graph decision."""
+        from vllm import SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+
+        prompt_ids = self._prompt_ids(
+            system, question, recent or [], remembered or [], self.model_limit - max_tokens, context_as_data,
+        )
+        params = SamplingParams(
+            max_tokens=max_tokens, temperature=0 if schema is not None else 0.5,
+            structured_outputs=StructuredOutputsParams(json=schema) if schema is not None else None,
+        )
+        result = self.engine.generate({"prompt_token_ids": prompt_ids}, params, use_tqdm=False)[0].outputs[0]
+        text = re.sub(r"^\s*<think>.*?</think>", "", result.text, flags=re.DOTALL).strip()
+        if not text or text.startswith("<think>") or (schema is not None and result.finish_reason != "stop"):
+            raise GenerationError("The model did not finish a usable response.")
+        if result.finish_reason == "length":
+            text += "\n\n[Answer stopped at the output limit.]"
+        return text

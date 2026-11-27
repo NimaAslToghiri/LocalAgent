@@ -6,6 +6,7 @@
 <title>Signal Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.17/dist/purify.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark-dimmed.min.css">
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 <style>
@@ -153,6 +154,7 @@ body {
     transition: all 0.2s;
 }
 .icon-btn:hover { color: var(--text-secondary); border-color: var(--border-light); background: var(--bg-tertiary); }
+.icon-btn:disabled { opacity: 0.45; cursor: default; }
 .icon-btn.confirming { color: #f59e0b; border-color: rgba(245,158,11,0.3); background: rgba(245,158,11,0.08); }
 
 /* ===== Chat Area ===== */
@@ -330,6 +332,7 @@ body {
 
 /* ===== Message Content (Markdown) ===== */
 .message-content { word-wrap: break-word; overflow-wrap: break-word; }
+.message-content-plain { white-space: pre-wrap; }
 .message-content p { margin-bottom: 0.6em; }
 .message-content p:last-child { margin-bottom: 0; }
 .message-content h1, .message-content h2, .message-content h3 {
@@ -342,7 +345,10 @@ body {
 .message-content h3 { font-size: 1.02em; }
 .message-content ul, .message-content ol { margin-bottom: 0.6em; padding-left: 1.4em; }
 .message-content li { margin-bottom: 0.2em; }
-.message-content a { color: var(--accent-light); text-decoration: underline; text-underline-offset: 2px; }
+.message-content a, .message-sources a { color: var(--accent-light); text-decoration: underline; text-underline-offset: 2px; }
+.message-sources { margin-top: 8px; font-size: 0.8em; overflow-wrap: anywhere; }
+.message-sources ul { padding-left: 1.4em; }
+.message-sources blockquote { color: var(--text-secondary); margin: 0.2em 0 0.6em; }
 .message-content strong { color: var(--text-primary); font-weight: 600; }
 .message-content blockquote {
     border-left: 3px solid var(--accent-dim);
@@ -653,7 +659,7 @@ body {
     <!-- Input Area -->
     <footer id="input-area">
         <div class="input-wrapper">
-            <textarea id="user-input" placeholder="Type your message..." rows="1" aria-label="Message input"></textarea>
+            <textarea id="user-input" placeholder="Type your message..." rows="1" maxlength="12000" aria-label="Message input"></textarea>
             <button id="send-btn" disabled title="Send message" aria-label="Send message">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
@@ -673,7 +679,8 @@ body {
         ws: null,
         connected: false,
         messages: [],
-        isGenerating: false,
+        conversationId: null,
+        pending: null,
         reconnectAttempts: 0,
         maxReconnect: 15,
         baseDelay: 800,
@@ -694,6 +701,8 @@ body {
     const statusText = $('#status-text');
     const toastBox = $('#toast-container');
     const chatArea = $('#chat-area');
+    const sessionKey = 'signal-conversation';
+    try { state.conversationId = sessionStorage.getItem(sessionKey); } catch {}
 
     /* ===== WebSocket ===== */
     function connect() {
@@ -708,9 +717,7 @@ body {
         }
 
         state.ws.onopen = () => {
-            state.connected = true;
-            state.reconnectAttempts = 0;
-            setStatus('connected');
+            state.ws.send(JSON.stringify({ type: 'hello', conversation_id: state.conversationId }));
         };
 
         state.ws.onmessage = e => {
@@ -718,9 +725,17 @@ body {
             catch(err) { console.error('Parse error:', err); }
         };
 
-        state.ws.onclose = () => {
+        state.ws.onclose = event => {
             state.connected = false;
-            setStatus('disconnected');
+            if (state.pending) toast('Connection lost while waiting for the server');
+            state.pending = null;
+            hideTyping();
+            resetClearBtn();
+            refreshSend();
+            if (event.code === 1008) {
+                state.conversationId = null;
+                try { sessionStorage.removeItem(sessionKey); } catch {}
+            }
             scheduleReconnect();
         };
 
@@ -754,38 +769,58 @@ body {
 
     /* ===== Message Handling ===== */
     function handleMsg(data) {
-        if (data.type === 'status' && data.status === 'thinking') {
-            showTyping();
-        } else if (data.type === 'response') {
-            hideTyping();
-            addMsg('agent', data.content);
-            state.isGenerating = false;
+        if (data.type === 'ready') {
+            state.conversationId = data.conversation_id;
+            try { sessionStorage.setItem(sessionKey, state.conversationId); } catch {}
+            state.connected = true;
+            state.reconnectAttempts = 0;
+            setStatus('connected');
+            clearChat();
+            for (const turn of data.turns) {
+                addMsg('user', turn.user, false, [], false);
+                addMsg('agent', turn.reply.content, false, turn.reply.sources, false, turn.reply.plain_text);
+            }
             refreshSend();
-        } else if (data.type === 'error') {
+        } else if (data.type === 'status' && data.status === 'thinking') {
+            showTyping();
+        } else if (['response', 'error', 'cleared'].includes(data.type)) {
             hideTyping();
-            addMsg('agent', data.content, true);
-            state.isGenerating = false;
+            if (data.type === 'cleared') {
+                clearChat();
+                toast('Chat cleared');
+            } else if (data.type === 'error' && state.pending === 'clear') {
+                toast(data.content);
+            } else {
+                addMsg('agent', data.content, data.type === 'error', data.sources, true, data.plain_text);
+            }
+            state.pending = null;
             refreshSend();
         }
     }
 
+    /** Send only on a ready socket and keep the input if the send fails. */
+    function sendRequest(request) {
+        if (!state.connected || state.pending || state.ws.readyState !== WebSocket.OPEN) return false;
+        try { state.ws.send(JSON.stringify(request)); }
+        catch { toast('Connection lost. Please try again.'); return false; }
+        state.pending = request.type;
+        refreshSend();
+        return true;
+    }
+
     function send(content) {
         const text = (content || '').trim();
-        if (!text || !state.connected || state.isGenerating) return;
+        if (!text || !sendRequest({ type: 'message', content: text })) return;
 
         addMsg('user', text);
         input.value = '';
         autoResize();
         refreshSend();
-
-        state.isGenerating = true;
-        refreshSend();
-        state.ws.send(JSON.stringify({ type: 'message', content: text }));
     }
 
-    function addMsg(role, content, isError) {
+    function addMsg(role, content, isError, sources = [], showTime = true, plainText = false) {
         const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-        const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const time = showTime ? new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
         state.messages.push({ id, role, content, time, isError: !!isError });
         emptyState.classList.add('hidden');
 
@@ -803,7 +838,8 @@ body {
             </div>`;
         }
 
-        const rendered = role === 'agent' ? renderMd(content) : escHtml(content).replace(/\n/g, '<br>');
+        const rendered = plainText ? escHtml(content)
+            : role === 'agent' && !isError ? renderMd(content) : escHtml(content).replace(/\n/g, '<br>');
         const sender = role === 'user' ? 'You' : 'Agent';
 
         el.innerHTML = `${avatar}
@@ -820,21 +856,53 @@ body {
                         </svg>
                     </button>
                 </div>
-                <div class="message-content">${rendered}</div>
+                <div class="message-content${plainText ? ' message-content-plain' : ''}">${rendered}</div>
             </div>`;
 
+        appendSources(el.querySelector('.message-bubble'), sources);
         messagesEl.appendChild(el);
         requestAnimationFrame(() => el.classList.add('message-visible'));
         scrollBottom();
     }
 
-    /* ===== Markdown ===== */
-    function renderMd(text) {
-        if (typeof marked === 'undefined') return escHtml(text).replace(/\n/g, '<br>');
+    /** Render verified source titles as text and link only to web URLs. */
+    function appendSources(bubble, sources) {
+        if (!sources.length) return;
+        const details = document.createElement('details');
+        details.className = 'message-sources';
+        const summary = document.createElement('summary');
+        summary.textContent = 'Search sources (snippets)';
+        const list = document.createElement('ul');
+        for (const source of sources) {
+            let url;
+            try { url = new URL(source.url); } catch { continue; }
+            if (!['https:', 'http:'].includes(url.protocol)) continue;
+            const item = document.createElement('li');
+            const link = document.createElement('a');
+            link.href = url.href;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.textContent = `[${source.id}] ${source.title}`;
+            item.append(link);
+            for (const excerpt of source.excerpts || []) {
+                const quote = document.createElement('blockquote');
+                quote.textContent = excerpt;
+                item.append(quote);
+            }
+            list.append(item);
+        }
+        if (list.childElementCount) {
+            details.append(summary, list);
+            bubble.append(details);
+        }
+    }
 
-        const renderer = {
-            code({ text: code, lang }) {
-                const language = lang || 'text';
+    const markdown = typeof marked === 'undefined' ? null : new marked.Marked({
+        breaks: true,
+        gfm: true,
+        renderer: {
+            code(code, infoString) {
+                const language = (infoString || '').trim().split(/\s+/)[0] || 'text';
                 let hl;
                 try {
                     hl = (typeof hljs !== 'undefined' && hljs.getLanguage(language))
@@ -845,20 +913,26 @@ body {
                 return `<div class="code-block">
                     <div class="code-header">
                         <span class="code-lang">${escHtml(language)}</span>
-                        <button class="code-copy-btn" onclick="window._copyCode(this)">
-                            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
-                            </svg> Copy
-                        </button>
+                        <button type="button" class="code-copy-btn">Copy</button>
                     </div>
                     <pre><code class="hljs">${hl}</code></pre>
                 </div>`;
-            }
-        };
+            },
+            html(raw) { return escHtml(raw); }
+        }
+    });
 
-        marked.use({ renderer, breaks: true, gfm: true });
-        try { return marked.parse(text); }
-        catch { return escHtml(text).replace(/\n/g, '<br>'); }
+    /** Sanitize rendered Markdown, falling back to escaped text if a library is unavailable. */
+    function renderMd(text) {
+        try {
+            if (markdown && window.DOMPurify?.isSupported) {
+                return DOMPurify.sanitize(markdown.parse(text), {
+                    USE_PROFILES: { html: true }, FORBID_TAGS: ['img', 'style', 'form', 'input'],
+                    FORBID_ATTR: ['style', 'id', 'name'], ALLOWED_URI_REGEXP: /^https?:\/\//i
+                });
+            }
+        } catch {}
+        return escHtml(text).replace(/\n/g, '<br>');
     }
 
     function escHtml(s) {
@@ -881,18 +955,19 @@ body {
         }).catch(() => toast('Copy failed'));
     };
 
-    window._copyCode = function(btn) {
+    /** Copy the contents of a rendered code block. */
+    function copyCode(btn) {
         const block = btn.closest('.code-block');
         const code = block.querySelector('code').textContent;
         navigator.clipboard.writeText(code).then(() => {
             btn.classList.add('copied');
-            btn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Copied';
+            btn.textContent = 'Copied';
             setTimeout(() => {
                 btn.classList.remove('copied');
-                btn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg> Copy';
+                btn.textContent = 'Copy';
             }, 2000);
         }).catch(() => toast('Copy failed'));
-    };
+    }
 
     /* ===== UI Helpers ===== */
     function showTyping() { typingEl.classList.remove('hidden'); scrollBottom(); }
@@ -910,7 +985,8 @@ body {
     }
 
     function refreshSend() {
-        sendBtn.disabled = !input.value.trim() || !state.connected || state.isGenerating;
+        sendBtn.disabled = !input.value.trim() || !state.connected || !!state.pending;
+        clearBtn.disabled = !state.connected || !!state.pending || !state.messages.length;
     }
 
     function toast(msg) {
@@ -942,13 +1018,16 @@ body {
     });
 
     sendBtn.addEventListener('click', () => send(input.value));
+    messagesEl.addEventListener('click', event => {
+        const button = event.target.closest('.code-copy-btn');
+        if (button) copyCode(button);
+    });
 
     clearBtn.addEventListener('click', () => {
         if (!state.messages.length) return;
 
         if (state.clearConfirm) {
-            clearChat();
-            toast('Chat cleared');
+            sendRequest({ type: 'clear' });
             resetClearBtn();
         } else {
             state.clearConfirm = true;
@@ -970,6 +1049,7 @@ body {
     });
 
     /* ===== Init ===== */
+    refreshSend();
     connect();
     input.focus();
 

@@ -1,71 +1,57 @@
-from llm.qwen import QwenAssistant
-from agent.graph_router import LangGraphAgent
-from tools.internet_search_tool import SearchTool
-import os
+"""Terminal entry point and shared app startup."""
+
 import logging
-import datetime
+
+from . import config
+from .agent.graph_router import LangGraphAgent
+from .agent.memory import ConversationMemory
+from .llm.qwen import GenerationError, QwenAssistant
+from .tools.internet_search_tool import SearchTool
 
 
-os.environ["CUDA_PATH"] = "/usr/local/cuda-12.6"
+logger = logging.getLogger(__name__)
+CLI_CONVERSATION = "local-terminal"
 
 
-def setup_logger(name: str) -> logging.Logger:
-    """Configures a thread-safe, production-grade console and file logger."""
-    logger = logging.getLogger(name)
-    if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
-        )
-        
-        # Console Handler (INFO level for clean user output)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
-        
-        # File Handler (DEBUG level for deep trace troubleshooting)
-        os.makedirs("logs", exist_ok=True)
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        fh = logging.FileHandler(f"logs/{current_time}.log", encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
-        
-    return logger
+def build_agent() -> LangGraphAgent:
+    """Load the configured 4B engine and connect it to search and local memory."""
+    config.configure_logging()
+    if not (config.MODEL_PATH / "config.json").is_file():
+        raise FileNotFoundError(f"Model not found at {config.MODEL_PATH}. Run python download_model.py first.")
+    logger.info("Loading model from %s (context: %d tokens)", config.MODEL_PATH, config.MAX_MODEL_LEN)
+    llm = QwenAssistant(config.MODEL_PATH, config.MAX_MODEL_LEN, config.GPU_MEMORY_UTILIZATION)
+    memory = ConversationMemory(config.DATA_DIR / "memory")
+    return LangGraphAgent(llm, SearchTool(), memory)
 
 
-logger = setup_logger("AgentLogger")
-
-
-def main():
-    
-    assistant = QwenAssistant(
-        model_path="/home/nimaasltoghiri/Documents/self_projects/Agentic_Signal/models/Qwen3-4b-AWQ"
-    )
-
-    tools = [SearchTool()]
-
-    agent = LangGraphAgent(
-        llm=assistant,
-        tools=tools
-    )
-
-    logger.info("Agent started")
-
-    while True:
-
-        user_input = input("You: ").strip()
-
-        if user_input in ["exit", "quit"]:
-            break
-
-        if not user_input:
-            continue
-
-        response = agent.ask(user_input)
-
-        print("\nAssistant:\n", response, "\n")
+def main() -> None:
+    """Run a terminal conversation that can be resumed or cleared across launches."""
+    agent = build_agent()
+    try:
+        while True:
+            text = input("You: ").strip()
+            if text in ("quit", "exit"):
+                break
+            if not text:
+                continue
+            try:
+                if text == "/clear":
+                    agent.clear(CLI_CONVERSATION)
+                    print("Chat cleared.")
+                    continue
+                reply = agent.ask(text, CLI_CONVERSATION)
+                print(f"\nAssistant: {reply['content']}\n")
+                for source in reply["sources"]:
+                    print(f"[{source['id']}] {source['title']}: {source['url']}")
+            except (ValueError, GenerationError) as error:
+                print(str(error))
+            except Exception as error:
+                logger.error("Turn failed: %s", type(error).__name__)
+                print("That operation failed. Please try again.")
+    except (EOFError, KeyboardInterrupt):
+        print()
+    finally:
+        agent.search.close()
 
 
 if __name__ == "__main__":

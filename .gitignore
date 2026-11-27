@@ -1,6 +1,11 @@
-.venv/ 
+.venv/
 .vscode/
 .env
+.env.*
+!.env.example
+.signal/
+assistant_agent/conversation_db/
+assistant_agent/retrived_messages.txt
 future_ideas.txt
 pre_run_command.txt
 models/
